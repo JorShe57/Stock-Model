@@ -8,11 +8,26 @@ import plotly.graph_objs as go
 import plotly.io as pio
 from datetime import datetime, timedelta
 import numpy as np
+from flask_caching import Cache
 
-# Initialize Flask app
+# Initialize Flask app and caching
 app = Flask(__name__)
+app.config['CACHE_TYPE'] = 'SimpleCache'
+cache = Cache(app)
 
-# Step 1: Fetch Data from yfinance
+# Set random seed for reproducibility
+import tensorflow as tf
+import random
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+
+set_seed()
+
+# Step 1: Fetch Data from yfinance (with caching)
+@cache.memoize(timeout=3600)  # Cache for 1 hour
 def fetch_data_from_api(symbol, start_date, end_date):
     try:
         df = yf.download(symbol, start=start_date, end=end_date, interval="1d")
@@ -24,10 +39,11 @@ def fetch_data_from_api(symbol, start_date, end_date):
 
 # Step 2: Preprocess data
 def preprocess_data(data):
+    global_scaler = MinMaxScaler(feature_range=(0, 1))  # Consistent scaling range
     data = data.values.reshape(-1, 1)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    data_normalized = scaler.fit_transform(data)
-    return data_normalized, scaler
+    global_scaler.fit(data)  # Fit to full dataset for consistent scaling
+    data_normalized = global_scaler.transform(data)
+    return data_normalized, global_scaler
 
 # Step 3: Create sequences for LSTM
 def create_sequences(data, sequence_length=60):
@@ -39,25 +55,26 @@ def create_sequences(data, sequence_length=60):
 
 # Step 4: Build LSTM model
 def build_lstm_model(input_shape):
-    model = Sequential()
-    model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
-    model.add(Dropout(0.2))
-    model.add(LSTM(units=50))
-    model.add(Dropout(0.2))
-    model.add(Dense(units=1))
+    model = Sequential([
+        LSTM(units=50, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(units=50),
+        Dropout(0.2),
+        Dense(units=1)
+    ])
     model.compile(optimizer='adam', loss='mean_squared_error')
     return model
 
 # Step 5.1: Predict Future Prices with Confidence Intervals
-def predict_future_prices_with_intervals(model, data, scaler, sequence_length=60, num_days=10, simulations=10):
+def predict_future_prices_with_intervals(model, data, scaler, sequence_length=60, num_days=30, simulations=1000):
     future_predictions = []
     last_sequence = data[-sequence_length:]  # Get the last sequence from the data
 
     for day in range(num_days):
-        # Monte Carlo Simulations with vectorized operations
+        # Monte Carlo Simulations with reduced noise
         input_data = np.tile(last_sequence.reshape(1, sequence_length, 1), (simulations, 1, 1))
         simulated_predictions = model.predict(input_data, verbose=0).flatten()
-        simulated_predictions += np.random.normal(0, 0.01, size=simulations)  # Adjust std deviation as needed
+        simulated_predictions += np.random.normal(0, 0.001, size=simulations)  # Reduced std deviation
 
         mean_prediction = np.mean(simulated_predictions)
         lower_bound = np.percentile(simulated_predictions, 2.5)
@@ -78,13 +95,11 @@ def predict_future_prices_with_intervals(model, data, scaler, sequence_length=60
 
 # Step 5.2: Create Plot with Confidence Intervals
 def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bounds, upper_bounds, future_dates):
-    # Slice the historical data to only include the last 60 days
     historical_dates = dates[-60:]
     historical_prices = actual_prices[-60:]
 
     fig = go.Figure()
 
-    # Historical Prices
     fig.add_trace(go.Scatter(
         x=historical_dates,
         y=historical_prices,
@@ -94,7 +109,6 @@ def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bou
         hovertemplate='Date: %{x}<br>Price: %{y:.2f}<extra></extra>'
     ))
 
-    # Mean Predictions
     fig.add_trace(go.Scatter(
         x=future_dates,
         y=mean_predictions.flatten(),
@@ -105,7 +119,6 @@ def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bou
         hovertemplate='Date: %{x}<br>Mean Predicted Price: %{y:.2f}<extra></extra>'
     ))
 
-    # Upper Band (Interactive Points)
     fig.add_trace(go.Scatter(
         x=future_dates,
         y=upper_bounds.flatten(),
@@ -116,7 +129,6 @@ def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bou
         hovertemplate='Date: %{x}<br>Upper Band Price: %{y:.2f}<extra></extra>'
     ))
 
-    # Lower Band (Interactive Points)
     fig.add_trace(go.Scatter(
         x=future_dates,
         y=lower_bounds.flatten(),
@@ -127,7 +139,6 @@ def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bou
         hovertemplate='Date: %{x}<br>Lower Band Price: %{y:.2f}<extra></extra>'
     ))
 
-    # Confidence Interval (Shaded Region)
     fig.add_trace(go.Scatter(
         x=np.concatenate([future_dates, future_dates[::-1]]),
         y=np.concatenate([upper_bounds.flatten(), lower_bounds.flatten()[::-1]]),
@@ -143,7 +154,7 @@ def create_plot_with_intervals(dates, actual_prices, mean_predictions, lower_bou
         xaxis_title='Date',
         yaxis_title='Price',
         template='plotly_white',
-        hovermode='x unified'  # Align hover to show all data for a single date
+        hovermode='x unified'
     )
 
     return pio.to_html(fig, full_html=False)
@@ -177,7 +188,7 @@ def predict():
 
         # Predict future prices
         mean_predictions, lower_bounds, upper_bounds = predict_future_prices_with_intervals(
-            model, data_normalized, scaler, sequence_length=sequence_length, num_days=30, simulations=100
+            model, data_normalized, scaler, sequence_length=sequence_length, num_days=30, simulations=1000
         )
 
         # Generate future dates
@@ -193,7 +204,6 @@ def predict():
             future_dates=future_dates
         )
 
-        # Return results
         return render_template('prediction.html', plot_html=plot_html)
 
     except Exception as e:
@@ -201,4 +211,3 @@ def predict():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
